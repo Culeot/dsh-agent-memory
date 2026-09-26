@@ -80,6 +80,7 @@
     "scripts": {
         "build": "node scripts/build.mjs",
         "test": "node --test",
-        "smoke": "node scripts/smoke.mjs"
+        "smoke": "node scripts/smoke.mjs",
+        "prepublishOnly": "npm run build && npm test"
     }
 }
