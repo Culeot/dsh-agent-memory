@@ -28,6 +28,7 @@ export declare const MemoryRecordSchema: z.ZodObject<{
     accessedAt: z.ZodNullable<z.ZodString>;
     accessCount: z.ZodNumber;
     expiresAt: z.ZodNullable<z.ZodString>;
+    supersededBy: z.ZodOptional<z.ZodNullable<z.ZodString>>;
 }, z.core.$strip>;
 export type MemoryRecord = z.infer<typeof MemoryRecordSchema>;
 /** The domain spec. `version` stamps the medium; bump on schema changes. */
@@ -48,6 +49,7 @@ export declare const memoryDomain: {
             accessedAt: string | null;
             accessCount: number;
             expiresAt: string | null;
+            supersededBy?: string | null | undefined;
         }>;
     };
 };
