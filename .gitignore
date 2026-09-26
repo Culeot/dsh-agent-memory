@@ -22,3 +22,12 @@ gh-push.mjs
 # IDE
 .vscode/
 .idea/
+
+# 冒烟脚本运行前的记忆库备份
+*.smoke-backup
+
+# Python 训练脚本
+__pycache__/
+*.pyc
+work/
+.venv/

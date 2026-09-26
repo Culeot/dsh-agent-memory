@@ -18,6 +18,7 @@ DeepSeek Harness(DSH)的跨会话长期记忆插件。
 - **防衰退机制**:协议段包含自我强化规则:任务开头检索重读核心规则、同类错误重复自动固化教训、语言漂移触发自我纠正。
 - **自我纠错闭环**:同一错误(相同 code/消息)重复出现 `lessonizeAfter` 次(默认 2)时,插件提示 agent 把它固化为 importance=3 的教训;教训入库后会在相关话题上自动注入,防止再犯。用户纠正则由记忆协议覆盖(当场固化)。
 - **中文友好检索**:中文按 bigram(双字)索引 + 单字兜底 + BM25 词频信号,英文按词,另加整串匹配。不需要分词库或任何 ML 依赖。
+- **可选语义通道**:第二个独立打分的通道——一个本地训练出来的句向量模型,走 ONNX 跑。要你自己训好模型并把 `semanticModelDir` 指过去才启用(插件不含模型);启用后与词面打分融合。详见 [语义检索](#语义检索可选自己训练模型)。
 - **可解释召回**:每条检索结果附命中原因(reasons)——子串/标签/双字重合/BM25/重要度/新鲜度/使用频率,你可以和 agent 一起审计"为什么这条记忆被翻出来"。
 - **记忆面板(Web UI)**:设置里的一级导航「记忆」——统计、搜索、类型过滤,还能直接**新建/编辑/删除**记忆,改完立即生效,深色模式自适应。
 - **memory_sediment**:会话收尾或用户纠正后,把值得长期保留的事实/决策/教训批量沉淀(≤3 条/次、带冷却防噪),agent 总结已有上下文、零额外模型成本。
@@ -36,6 +37,45 @@ DeepSeek Harness(DSH)的跨会话长期记忆插件。
 | `memory_sediment` | 批量沉淀多条记忆(会话收尾用),带条数上限与冷却防噪。 |
 
 分类:`fact | preference | decision | lesson | todo | note`。范围:`user`(所有项目生效)或 `project`(仅当前项目)。
+
+## 语义检索(可选):自己训练模型
+
+**插件包里的模型文件是空的,一个都没有。** 纯词面打分本身就是完整的,不需要任何额外东西;语义通道是你之后可以加上的第二个意见。
+
+值得加,但理由跟你想的不一样。本机 382 条 held-out 查询(从真实记忆库里挖的):
+
+| 通道 | MRR | Recall@1 |
+|---|---|---|
+| 只用词面 | 0.7248 | 63.4% |
+| 只用语义 | 0.7121 | 61.3% |
+| **两路融合** | **0.8432** | **76.4%** |
+
+第二行再看一眼:语义**单独跑是输给词面的**。没有任何一个「下载下来就能用」的模型能让检索自己变强。增益全来自融合——两个通道在**不同的地方**犯错:词面精确吃路径、命令、变量名,语义管「换个说法还认得出」。
+
+### 为什么不打包一个模型
+
+- **太大**——基座 393 MB + 训练产物 391 MB + 量化后 ONNX 486 MB。这东西不该进 npm 包。
+- **而且一定是不对的模型**——检索模型学的是「你的查询长什么样、你的记忆长什么样」。我们这边是中文技术笔记、关键词堆叠式查法(`语音插件 语音播报 speak tts`)。你那边大概率不是,套错了模型是**静默降级**(不报错,只是变差)。
+- **可选就是真的可选**——`@huggingface/transformers` 没装、模型目录不存在、向量算一半失败,统统静默退回词面打分,并把原因记下来。一个记忆插件因为可选加速器没配好就起不来,那比没有加速器还糟。
+
+### 完整教程
+
+见 **[`training/README.md`](training/README.md)**——环境准备、下基座模型、切分 held-out、双轨造训练对、对比学习训练、导出 ONNX 并做一致性验证、接进插件,一步一步都有。
+
+精简版:
+
+```bash
+pip install torch transformers onnxruntime numpy huggingface_hub
+
+python training/prep.py                              # 切分记忆库,留出 20%
+python training/gen_data.py --kw-per 4 --llm-per 6   # 造查询/记忆对
+python training/train.py --epochs 30 --batch 32      # 对比学习训练
+python training/export_onnx.py                       # → work/model-onnx/
+```
+
+然后在 profile 里 `pnpm add @huggingface/transformers`,把 `semanticModelDir` 指到 `work/model-onnx`,重启 DSH。
+
+`training/` 下六个脚本的路径全部走环境变量(`MEM_TRAIN_WORK`、`MEM_TRAIN_MEMORY`、`MEM_TRAIN_BASE`、`MEM_TRAIN_LLM`),放哪个目录都能跑。有 NVIDIA GPU 快很多(RTX 4080 Laptop 12 GB:306 条记忆 30 轮约 2.4 分钟),CPU 也能跑,就是慢。磁盘留 2 GB。
 
 ## 外部修改防护
 
@@ -79,21 +119,54 @@ npm install dsh-agent-memory
 
 ## 配置
 
-全部可选:
+全部可选。
+
+**存储**
 
 | 配置项 | 默认 | 说明 |
 |---|---|---|
 | `maxRecords` | 400 | 容量上限,超出自动淘汰低价值记录 |
 | `maxContentChars` | 2000 | 单条记忆正文长度上限 |
+| `mergeSimilarity` | 0.7 | 近重复合并阈值 |
+| `recencyHalfLifeDays` | 90 | 新鲜度半衰期(天) |
+| `protocolSection` | true | 注入记忆协议 prompt 段 |
+| `recallContentMax` | 400 | 单条召回结果返回的正文长度上限 |
+
+**注入**
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
 | `injectEnabled` | true | 每轮按当前消息注入相关记忆(`agent/pre-step`) |
 | `injectCount` | 3 | 每轮最多注入条数(0 关闭) |
 | `injectMinScore` | 1.0 | 最低相关性分数阈值(0=不按分数过滤,只按排名) |
 | `injectMaxChars` | 120 | 每条注入摘要长度上限 |
+| `injectBudgetRatio` | 0.5 | 只注入分数落在最高分这个比例之内的候选——一个问题只有一个明显答案时,就注入一条而不是三条(0=关闭,退回旧的「下限+上限」行为) |
+| `noMatchThreshold` | 0.18 | 最高分低于此值时,召回返回 `noMatch` 且不注入任何东西。给一条勉强相关的记忆不是中性的——它要花注意力,还会误导 |
+
+**排序**
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `boostSlope` | 0.1 | 重要度加成斜率:`1 + (importance − 1) × slope` |
+
+**语义通道**(需要你自己训的模型,见上文)
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `semanticEnabled` | true | 总开关;`semanticModelDir` 为空时它不起作用 |
+| `semanticModelDir` | `''` | 模型目录,需含 `config.json`、`tokenizer.json`、`onnx/*.onnx`。留空=关闭该通道 |
+| `semanticCacheDir` | `''` | 向量缓存目录。留空=`$DSH_HOME/storages/memory-semantic` |
+| `semanticWeight` | 0.3 | 融合里语义的权重:`relevance = w × semantic + (1 − w) × lexical` |
+| `semanticMin` | 0.5 | 余弦下限,低于它的语义分不算命中 |
+
+**教训与沉淀**
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
 | `lessonizeEnabled` | true | 同类错误重复时自动提示固化教训 |
 | `lessonizeAfter` | 2 | 同指纹错误出现几次后提示 |
-| `recencyHalfLifeDays` | 90 | 新鲜度半衰期(天) |
-| `mergeSimilarity` | 0.7 | 近重复合并阈值 |
-| `protocolSection` | true | 注入记忆协议 prompt 段 |
+| `sedimentMaxEntries` | 3 | 单次 `memory_sediment` 最多沉淀条数 |
+| `sedimentCooldownMs` | 300000 | 两次沉淀之间的冷却(5 分钟) |
 
 ## 卸载与排查
 

@@ -20,6 +20,7 @@ Remembers facts, preferences, decisions, and lessons across sessions, so a new s
 - **Built-in hygiene** — capacity cap with lowest-value eviction first; near-duplicate entries merge instead of piling up (Jaccard ≥ 0.7); optional TTL expiry; deleting importance-3 records requires an explicit confirm.
 - **Chinese-friendly search** — Chinese text is indexed by bigrams plus single-char fallback plus a BM25 term-frequency signal, English by words, plus exact substring matching. Works without a tokenizer or any ML dependency.
 - **No unrelated association** — weak matches (pure single-char coincidence, filler-only queries like "ok了吗") score zero and are never injected; only substring/tag/bigram-strength matches surface. Saves tokens on short chatter.
+- **Optional semantic channel** — a second, independent scorer: a locally-trained sentence encoder running through ONNX. Dormant until you point `semanticModelDir` at a model you trained yourself (no model ships with the plugin). Once present it fuses with lexical scoring. See [Semantic retrieval](#semantic-retrieval-optional--you-train-the-model-yourself).
 - **Explainable recall** — every recall hit carries `reasons` (substring/tag/bigram/BM25/importance/recency/access signal breakdown), so both you and the agent can audit *why* a memory surfaced.
 - **Memory panel (Web UI)** — a top-level "记忆" entry in Settings with stats, search, kind filters, and direct **create / edit / delete** of memories; changes apply immediately, dark mode included.
 - **memory_sediment** — batch-persist facts/decisions/lessons at session wind-down (≤3 entries per call, cooldown-guarded); the agent summarizes what it already has in context, so there is zero extra model cost.
@@ -38,6 +39,45 @@ Remembers facts, preferences, decisions, and lessons across sessions, so a new s
 | `memory_sediment` | Batch-persist several memories at once (session wind-down), with an entry cap and cooldown guard. |
 
 Kinds: `fact | preference | decision | lesson | todo | note`. Scopes: `user` (applies everywhere) or `project` (this project only).
+
+## Semantic retrieval (optional) — you train the model yourself
+
+**No model file ships with this plugin.** Lexical scoring on its own is complete and needs nothing else; the semantic channel is a second opinion you can add later.
+
+It is worth adding, but not for the reason you'd expect. On a 382-query held-out set built from a real memory bank:
+
+| Channel | MRR | Recall@1 |
+|---|---|---|
+| lexical only | 0.7248 | 63.4% |
+| semantic only | 0.7121 | 61.3% |
+| **both, fused** | **0.8432** | **76.4%** |
+
+Read the middle row again: semantic **alone loses** to lexical. No single model you could download makes retrieval better by itself. The gain comes from fusing two channels that fail in *different* places — lexical owns exact terms, paths and command names; semantic owns paraphrase.
+
+### Why no model is bundled
+
+- **Size** — 393 MB base model + 391 MB trained + 486 MB quantized ONNX. That is not something to put in an npm package.
+- **It would be the wrong model anyway** — a retriever learns what *your* queries and *your* memories look like. Ours are Chinese technical notes queried as keyword stacks (`语音插件 语音播报 speak tts`). Yours almost certainly differ, and a mismatched retriever is a silent downgrade.
+- **Optional means optional** — a missing `@huggingface/transformers`, a missing model directory, or a failed vector computation all degrade quietly to lexical scoring and record why. A memory plugin that refuses to start because an optional accelerator is misconfigured would be worse than having no accelerator at all.
+
+### Full walkthrough
+
+See **[`training/README.md`](training/README.md)** — environment setup, downloading the base model, held-out splitting, two-track training-pair generation, contrastive training, ONNX export with a correctness check, and wiring the result into the plugin.
+
+The short version:
+
+```bash
+pip install torch transformers onnxruntime numpy huggingface_hub
+
+python training/prep.py                              # split the memory bank, hold out 20%
+python training/gen_data.py --kw-per 4 --llm-per 6   # build query/memory pairs
+python training/train.py --epochs 30 --batch 32      # contrastive training
+python training/export_onnx.py                       # → work/model-onnx/
+```
+
+Then, in your profile: `pnpm add @huggingface/transformers`, point `semanticModelDir` at `work/model-onnx`, restart DSH.
+
+All six scripts in `training/` take their paths from environment variables (`MEM_TRAIN_WORK`, `MEM_TRAIN_MEMORY`, `MEM_TRAIN_BASE`, `MEM_TRAIN_LLM`), so they run from any directory. An NVIDIA GPU helps (RTX 4080 Laptop 12 GB: ~2.4 min for 306 memories × 30 epochs) but CPU works — just slower. Budget ~2 GB of disk.
 
 ## External-modification protection
 
@@ -104,21 +144,54 @@ Requires the storage trio already present in the profile (`dsh-storage`, `dsh-st
 
 ## Configuration
 
-All options are optional:
+All options are optional.
+
+**Store**
 
 | Option | Default | Meaning |
 |---|---|---|
 | `maxRecords` | 400 | Capacity cap; lowest-value records evicted first. |
 | `maxContentChars` | 2000 | Max content length per record. |
+| `mergeSimilarity` | 0.7 | Near-duplicate merge threshold. |
+| `recencyHalfLifeDays` | 90 | Freshness half-life, in days. |
+| `protocolSection` | true | Inject the memory protocol prompt section. |
+| `recallContentMax` | 400 | Max content chars returned per recall hit. |
+
+**Injection**
+
+| Option | Default | Meaning |
+|---|---|---|
 | `injectEnabled` | true | Per-step injection of relevant memories (via `agent/pre-step`). |
 | `injectCount` | 3 | Max memories injected per step (0 disables). |
 | `injectMinScore` | 1.0 | Minimum relevance score to inject (0 = no threshold, just rank). |
 | `injectMaxChars` | 120 | Max chars per injected memory summary. |
+| `injectBudgetRatio` | 0.5 | Inject only candidates scoring within this fraction of the top hit — a query with one obvious answer injects one memory, not three (0 = off, historical floor-and-cap behaviour). |
+| `noMatchThreshold` | 0.18 | Below this top score, recall returns `noMatch` and injects nothing. Offering a weak memory is not neutral — it spends attention and misleads. |
+
+**Ranking**
+
+| Option | Default | Meaning |
+|---|---|---|
+| `boostSlope` | 0.1 | Importance boost slope: `1 + (importance − 1) × slope`. |
+
+**Semantic channel** (needs a model you trained — see above)
+
+| Option | Default | Meaning |
+|---|---|---|
+| `semanticEnabled` | true | Master switch; a no-op while `semanticModelDir` is empty. |
+| `semanticModelDir` | `''` | Directory holding `config.json`, `tokenizer.json`, `onnx/*.onnx`. Empty = channel off. |
+| `semanticCacheDir` | `''` | Vector-cache directory. Empty = `$DSH_HOME/storages/memory-semantic`. |
+| `semanticWeight` | 0.3 | Semantic weight in the fusion: `relevance = w × semantic + (1 − w) × lexical`. |
+| `semanticMin` | 0.5 | Cosine floor below which a semantic score doesn't count as a match. |
+
+**Lessons & sediment**
+
+| Option | Default | Meaning |
+|---|---|---|
 | `lessonizeEnabled` | true | Auto-nudge to solidify repeated errors as lessons. |
 | `lessonizeAfter` | 2 | Same error fingerprint occurrences before nudging. |
-| `recencyHalfLifeDays` | 90 | Freshness half-life. |
-| `mergeSimilarity` | 0.7 | Near-duplicate merge threshold. |
-| `protocolSection` | true | Inject the memory protocol prompt section. |
+| `sedimentMaxEntries` | 3 | Max memories per `memory_sediment` call. |
+| `sedimentCooldownMs` | 300000 | Cooldown between sediment calls (5 min). |
 
 ## Uninstall & troubleshooting
 
