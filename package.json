@@ -1,6 +1,6 @@
 {
     "name": "dsh-agent-memory",
-    "version": "0.8.4",
+    "version": "0.9.0",
     "description": "Cross-session long-term memory for DeepSeek Harness: a schema-validated memory domain over ctx.storage plus model-facing remember/recall/index/forget tools and a memory protocol prompt section.",
     "type": "module",
     "main": "lib/index.js",
@@ -55,7 +55,13 @@
         "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
         "@deepseek-ai/schemastery": "^3.18.1",
         "react": "^18.2.0",
-        "zod": "^4.4.3"
+        "zod": "^4.4.3",
+        "@huggingface/transformers": ">=3.0.0"
+    },
+    "peerDependenciesMeta": {
+        "@huggingface/transformers": {
+            "optional": true
+        }
     },
     "devDependencies": {
         "@deepseek-ai/cordis": "^4.0.1",

@@ -47,6 +47,24 @@ The store file is loaded once at startup and written as a whole by the running p
 - `memory_import` is the supported way to bulk-load data (goes through the write chain, file and memory stay in sync);
 - if you still edit `memory.json` by hand or copy it in, call `memory_reload` to merge it back (or restart).
 
+## Troubleshooting: panel reports HTTP 405
+
+A `transport failure for /dsh-memory-read/…: HTTP 405` in the memory panel means the RPC
+channel was **never mounted** — the request fell through to the SPA static fallback, which
+only serves GET/HEAD. Root cause is in DSH 0.1.5-rc.2 itself: `connection.rpc.handle()`
+resolves `webServer` from the *calling* context to register its route, and throws
+`cannot get property "webServer" without inject` when that lookup fails, silently dropping
+the channel (still unfixed in 0.1.6-alpha.2). This plugin therefore tries the official
+`handle()` first and, on failure, registers its own prefix routes through
+`ctx.inject(['connection', 'webServer'])`, reusing `connection.requestRejection()` for the
+Host/Origin fence and browser authentication.
+
+**A DSH restart is required** — routes are mounted at startup. Verify with:
+
+```bash
+curl -i -X POST http://127.0.0.1:3080/dsh-memory-read/stats   # 401 = route mounted (no cookie), 405 = stale process
+```
+
 ## Repeat suppression
 
 Per-step injection skips when the recalled set is unchanged from the previous step, so consecutive messages about the same topic don't re-inject the same block — the「相关记忆」notice appears on topic change, not on every message.

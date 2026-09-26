@@ -101,6 +101,15 @@ npm install dsh-agent-memory
 - **工具没出现**:检查行是否存在、依赖是否安装、是否重启过 DSH。
 - **存储报错**:memory 插件依赖存储三件套,profile 缺的话在 patch 里补上。
 - **memory.json 损坏**:纯 JSON,手动修复或直接删除(删除=清空记忆)。
+- **设置里的「记忆」面板报 `transport failure for /dsh-memory-read/…: HTTP 405`**:
+  405 是「路由根本没挂上」的信号——请求落到了 SPA 静态兜底(它只放行 GET/HEAD)。
+  成因是 DSH 0.1.5-rc.2 的 `connection.rpc.handle()` 自身缺陷:它内部用调用方 ctx 解析
+  `webServer` 来注册路由,解析不到就抛 `cannot get property "webServer" without inject`,
+  通道静默丢失(上游 0.1.6-alpha.2 仍未修)。本插件已改为:先试官方 `handle()`,
+  失败则自己经 `ctx.inject(['connection','webServer'])` 注册 prefix 路由,并复用
+  `connection.requestRejection()` 做鉴权。**改完必须重启 DSH 才生效**(路由在启动时注册)。
+  验证:`curl -i -X POST http://127.0.0.1:3080/dsh-memory-read/stats` → 无 cookie 期望 **401**(路由在,
+  鉴权拦下)、带浏览器 cookie 期望 **200**;若仍是 **405**,说明跑的还是旧进程。
 
 ## 开发
 

@@ -40,11 +40,28 @@ import {
   type MemoryKind,
   type MemoryScope,
 } from './spec.ts';
-import { rankRecords, hotRecords, isExpired, tokenSet, jaccard, scoreRecord, hasMeaningfulQuery } from './search.ts';
+import {
+  rankRecords,
+  rankRecordsHybrid,
+  countHybridMatches,
+  hotRecords,
+  isExpired,
+  tokenSet,
+  jaccard,
+  scoreRecord,
+  hasMeaningfulQuery,
+  DEFAULT_SEMANTIC_WEIGHT,
+  DEFAULT_SEMANTIC_MIN,
+  IMPORTANCE_BOOST_SLOPE,
+  LEXICAL_SATURATION,
+} from './search.ts';
+import { SemanticIndex, type SemanticConfig } from './semantic.ts';
 import { registerRpc } from './rpc.ts';
 
 export * from './spec.ts';
 export * from './search.ts';
+export * from './semantic.ts';
+export * from './rpc.ts';
 
 export const name = 'memory';
 export const inject = ['tools', 'storageDomain', 'systemPrompt'];
@@ -66,6 +83,12 @@ export const Config = z.object({
   injectEnabled: z.boolean().default(true),
   /** Maximum memories to inject per step (0 disables injection). Actual count depends on relevance. */
   injectCount: z.number().min(0).max(10).default(3),
+  /**
+   * Budgeted injection: keep the top memory plus any scoring within this
+   * fraction of it. 0 = off (historical behaviour: score floor + fixed cap).
+   * A clear winner then injects one memory instead of three mediocre ones.
+   */
+  injectBudgetRatio: z.number().min(0).max(1).default(0.5),
   /** Minimum score threshold for injection (0 = no threshold, just use rank). */
   injectMinScore: z.number().min(0).max(100).default(1.0),
   /** Max content chars per injected memory summary. */
@@ -84,6 +107,40 @@ export const Config = z.object({
    */
   lessonizeEnabled: z.boolean().default(true),
   lessonizeAfter: z.number().min(2).max(20).default(2),
+  /**
+   * Semantic channel: fuse a local sentence-embedding model with the lexical
+   * scorer. Needs @huggingface/transformers (an OPTIONAL peer dependency) plus
+   * a model directory; when either is missing, recall silently falls back to
+   * lexical-only — an optional accelerator must never break the plugin.
+   *
+   * Measured on a real 382-record bank: lexical 0.7248 MRR → fused 0.8432.
+   */
+  semanticEnabled: z.boolean().default(true),
+  /** Model directory (config.json / tokenizer.json / onnx/*.onnx). '' disables. */
+  semanticModelDir: z.string().default(''),
+  /** Vector-cache directory. '' = $DSH_HOME/storages/memory-semantic. */
+  semanticCacheDir: z.string().default(''),
+  /** Semantic weight in fusion: relevance = w*semantic + (1-w)*lexical. */
+  semanticWeight: z.number().min(0).max(1).default(DEFAULT_SEMANTIC_WEIGHT),
+  /** Minimum cosine for a record to count as a match with no lexical hit. */
+  semanticMin: z.number().min(0).max(1).default(DEFAULT_SEMANTIC_MIN),
+  /**
+   * Slope of the importance boost. The historical 0.75 measured -0.046 MRR
+   * versus no boost at all (most records sit at importance 3, so the boost
+   * separates nothing while punishing the rest). 0 disables it.
+   */
+  boostSlope: z.number().min(0).max(2).default(IMPORTANCE_BOOST_SLOPE),
+  /**
+   * "Say nothing rather than something wrong" gate, on the 0..1 relevance scale.
+   * When the best candidate scores below this, recall reports `noMatch` and the
+   * injection path stays silent — offering an unrelated memory is worse than
+   * offering none: it spends the attention budget and misleads.
+   *
+   * Calibrated against 382 queries that DO have an answer and 20 that do NOT
+   * (src/mem_calibrate.py). On the lexical path the equivalent base threshold
+   * was 0.735 (85% of real queries admitted, 5% of the negatives leaking).
+   */
+  noMatchThreshold: z.number().min(0).max(1).default(0.18),
 });
 
 function makeId(): string {
@@ -124,6 +181,34 @@ export function renderInjection(results: RecallResult['results'], maxChars: numb
 }
 
 /**
+ * Pick the memories worth spending attention on.
+ *
+ * The old rule was "everything above a score floor, capped at N" — which treats a
+ * clear winner and a pack of marginal matches identically. Budgeted selection
+ * looks at the *shape* of the score curve instead: keep the top record, then only
+ * those within `budgetRatio` of it. A query with one obvious answer injects one
+ * memory; a query with several comparably relevant memories injects several.
+ *
+ * Why this matters: attention is the scarce resource (see docs/BUILD-PLAN.md).
+ * Injecting a marginal memory is not neutral — it spends budget and can mislead.
+ *
+ * `budgetRatio` 0 disables the budget (historical behaviour: floor + cap only).
+ */
+export function selectForInjection<T extends { score: number }>(
+  results: readonly T[],
+  options: { minScore?: number; budgetRatio?: number; limit: number },
+): T[] {
+  const minScore = options.minScore ?? 0;
+  let kept = minScore > 0 ? results.filter((r) => r.score >= minScore) : [...results];
+  const ratio = options.budgetRatio ?? 0;
+  if (ratio > 0 && kept.length > 1) {
+    const top = kept[0]!.score;
+    if (top > 0) kept = kept.filter((r) => r.score >= top * ratio);
+  }
+  return kept.slice(0, Math.max(0, options.limit));
+}
+
+/**
  * Stable fingerprint of an error for same-mistake counting. Prefer a typed
  * code; fall back to the first meaningful line of the message.
  */
@@ -152,6 +237,8 @@ export type RememberResult = {
   merged: boolean;
   evicted: number;
   content: string;
+  /** Ids of older records this write marked as superseded (relation data). */
+  superseded?: string[];
 };
 
 export type RecallResult = {
@@ -164,11 +251,21 @@ export type RecallResult = {
     importance: number;
     updatedAt: string;
     score: number;
+    /** Set when a newer memory supersedes this one (it is shown, but down-weighted). */
+    supersededBy?: string | null;
     /** Human-readable hit reasons (query recall only; absent for hot set). */
     reasons?: string[];
   }>;
   /** Records that matched (after filters), before the limit cut. */
   totalMatched: number;
+  /**
+   * True when nothing cleared the relevance gate. Callers should say
+   * "no relevant memory" instead of presenting the top-ranked record — a wrong
+   * memory is more harmful than an absent one.
+   */
+  noMatch: boolean;
+  /** Fused relevance (0..1) of the best candidate; 0 when nothing was found. */
+  matchStrength: number;
   /** Records actually returned (== results.length). */
   returned: number;
 };
@@ -213,6 +310,12 @@ export type MemoryTable = {
  * overwriting a file another process edited.
  */
 export class MemoryCore {
+  /**
+   * Optional semantic channel. Null when disabled or when no model directory is
+   * configured; recall then behaves exactly as it did before this existed.
+   */
+  private readonly semantic: SemanticIndex | null;
+
   constructor(
     private readonly table: MemoryTable,
     private readonly config: {
@@ -220,6 +323,12 @@ export class MemoryCore {
       maxContentChars: number;
       mergeSimilarity: number;
       recencyHalfLifeDays: number;
+      semantic?: SemanticConfig | null;
+      semanticWeight?: number;
+      semanticMin?: number;
+      boostSlope?: number;
+      /** Relevance gate (0..1); below it recall reports noMatch. */
+      noMatchThreshold?: number;
     },
     private readonly beforeWrite?: () => void,
     /**
@@ -230,7 +339,41 @@ export class MemoryCore {
      * is falsely rejected as "externally modified".
      */
     private readonly onWritten?: () => void,
-  ) {}
+  ) {
+    // Constructed eagerly, loaded lazily: starting a plugin must not block on
+    // a 100 MB ONNX runtime, and a missing model must not be an error.
+    this.semantic = config.semantic ? new SemanticIndex(config.semantic) : null;
+  }
+
+  /** Semantic-channel diagnostics, surfaced to the UI/RPC layer. */
+  semanticStatus(): {
+    enabled: boolean;
+    ready: boolean;
+    reason: string | null;
+    backend: string | null;
+    vectors: number;
+  } {
+    return {
+      enabled: this.semantic !== null,
+      ready: this.semantic?.isReady ?? false,
+      reason: this.semantic?.unavailableReason ?? null,
+      backend: this.semantic?.backendName ?? null,
+      vectors: this.semantic?.vectorCount ?? 0,
+    };
+  }
+
+  /**
+   * Cosine scores for the pool, or null when the semantic channel is off.
+   * Never throws: an optional channel that fails must degrade, not break.
+   */
+  private async semanticScores(query: string, pool: readonly MemoryRecord[]): Promise<number[] | null> {
+    if (!this.semantic) return null;
+    try {
+      return await this.semantic.scores(query, pool);
+    } catch {
+      return null;
+    }
+  }
 
   private all(): MemoryRecord[] {
     return [...this.table.entries()].map(([, v]) => v);
@@ -255,6 +398,29 @@ export class MemoryCore {
     const existed = await this.table.delete(key);
     if (existed && this.onWritten) this.onWritten();
     return existed;
+  }
+
+  /**
+   * Mark older records as replaced by `newId`.
+   *
+   * The protocol has always told the model to note "已由 X 更新/覆盖" in the body
+   * when a decision changes — but that is discipline, not mechanism, and it left
+   * the outdated record ranking exactly as high as the new one. Turning the
+   * relation into data lets the ranker down-weight it (see SUPERSEDED_PENALTY).
+   *
+   * The old record keeps its content: auditable, and reversible by clearing
+   * `supersededBy`. Unknown ids and self-references are ignored.
+   */
+  private async markSuperseded(newId: string, ids: readonly string[] | undefined): Promise<string[]> {
+    if (!ids || ids.length === 0) return [];
+    const marked: string[] = [];
+    for (const oldId of ids) {
+      if (oldId === newId) continue;
+      if (!this.table.get(oldId)) continue;
+      await this.update(oldId, (current) => ({ ...current, supersededBy: newId }));
+      marked.push(oldId);
+    }
+    return marked;
   }
 
   /** Delete every TTL-expired record. Returns the number removed. */
@@ -304,6 +470,8 @@ export class MemoryCore {
     project?: string | null;
     importance?: number;
     ttlDays?: number;
+    /** Ids of older records this new memory replaces (they get marked). */
+    supersedes?: readonly string[];
     now?: number;
   }): Promise<RememberResult> {
     this.guardWrite();
@@ -345,7 +513,8 @@ export class MemoryCore {
         };
       });
       merged = true;
-      return { id: existing.id, merged: true, evicted: 0, content };
+      const supersededByMerge = await this.markSuperseded(existing.id, input.supersedes);
+      return { id: existing.id, merged: true, evicted: 0, content, superseded: supersededByMerge };
     }
 
     const id = makeId();
@@ -364,8 +533,9 @@ export class MemoryCore {
       expiresAt,
     };
     await this.put(id, record);
+    const superseded = await this.markSuperseded(id, input.supersedes);
     const evicted = await this.evict();
-    return { id, merged: false, evicted, content };
+    return { id, merged: false, evicted, content, superseded };
   }
 
   /**
@@ -403,13 +573,27 @@ export class MemoryCore {
 
     const limit = Math.max(1, Math.min(50, Math.round(input.limit ?? MEMORY_DEFAULTS.recallLimit)));
     const query = (input.query ?? '').trim();
+    const rankOptions = {
+      now,
+      recencyHalfLifeDays: this.config.recencyHalfLifeDays,
+      boostSlope: this.config.boostSlope,
+    };
+    const hybridOptions = {
+      ...rankOptions,
+      semanticWeight: this.config.semanticWeight,
+      semanticMin: this.config.semanticMin,
+    };
+    // Computed once per query over the filtered pool. Null means the channel is
+    // off (no package / no model), and the hybrid ranker then degrades to the
+    // pure-lexical behaviour that existed before.
+    const semantic = query === '' ? null : await this.semanticScores(query, pool);
     const ranked = query === ''
-      ? hotRecords(pool, limit, { now, recencyHalfLifeDays: this.config.recencyHalfLifeDays })
-      : rankRecords(pool, query, limit, { now, recencyHalfLifeDays: this.config.recencyHalfLifeDays });
-    // True match count before the limit cut (rankRecords filters internally).
+      ? hotRecords(pool, limit, rankOptions)
+      : rankRecordsHybrid(pool, query, limit, { ...hybridOptions, semantic });
+    // True match count before the limit cut (the rankers filter internally).
     const totalMatched = query === ''
       ? pool.length
-      : pool.filter((r) => scoreRecord(r, query, { now, recencyHalfLifeDays: this.config.recencyHalfLifeDays }) > 0).length;
+      : countHybridMatches(pool, query, { ...hybridOptions, semantic });
 
     // Touch the winners atomically so access tracking feeds future
     // scoring/eviction without racing concurrent merge/remember updates.
@@ -428,8 +612,20 @@ export class MemoryCore {
       }
     }
 
+    // 「宁可不给,也不硬凑」闸门:最高相关性低于阈值时明确报告没有匹配,
+    // 调用方据此保持沉默,而不是推一条无关记忆出去。
+    // 纯词面路径没有 fusion relevance,用归一化的 base 顶上,保证两种模式同尺度。
+    const topRelevance = ranked.length > 0
+      ? (ranked[0].relevance ?? Math.min(1, (ranked[0].base ?? 0) / LEXICAL_SATURATION))
+      : 0;
+    // 阈值 0 表示关闭闸门(gate > 0 才判断),这样旧配置与不传该参数的调用方行为不变。
+    const gate = this.config.noMatchThreshold ?? 0;
+    const noMatch = query !== '' && gate > 0 && topRelevance < gate;
+
     return {
       totalMatched,
+      noMatch,
+      matchStrength: Number(topRelevance.toFixed(4)),
       returned: ranked.length,
       results: ranked.map(({ record, score, reasons }) => ({
         id: record.id,
@@ -440,6 +636,7 @@ export class MemoryCore {
         importance: record.importance,
         updatedAt: record.updatedAt,
         score: Number(score.toFixed(3)),
+        ...(record.supersededBy ? { supersededBy: record.supersededBy } : {}),
         reasons,
       })),
     };
@@ -622,7 +819,7 @@ You have a cross-session long-term memory, and relevant memories are auto-inject
 Rules:
 - At the START of a task, run memory_recall with keywords from the request before diving in; use memory_index when you need the big picture of what is already known. The auto-injected block is a preview — recall for details.
 - DURING work, actively memory_remember anything the user will need in LATER sessions: facts about them or their environment, stated preferences, concluded decisions and their rationale, lessons from mistakes ("never do X again"), and cross-session todos. Quality over quantity — do not log noise.
-- When the user corrects outdated knowledge, fix memory right away (memory_forget, or overwrite via a new remember that merges).
+- When the user corrects outdated knowledge, fix memory right away: pass the stale record's id in \`supersedes\` when storing the new one. The old record stays stored (auditable) but is heavily down-weighted, so it stops being presented as the current conclusion. Use memory_forget only when a memory is *wrong*, not merely *outdated*.
 - When the user corrects you, or the same mistake recurs twice, immediately memory_remember it as a lesson (kind=lesson, importance=3) — the lesson then auto-injects on related topics, preventing recurrence.
 - Write lessons DIALECTICALLY — never absolute. Distinguish: (1) what went wrong and how to avoid it; (2) the CONDITIONS that caused the failure (would it have worked under different conditions? note the applicability boundary — a lesson's value depends on its conditions); (3) anything that actually worked — keep the salvageable part. Prefer "under condition A, X failed because B; the C part worked" over "X is impossible". When new evidence contradicts an old lesson (e.g. it worked under changed conditions), UPDATE the old lesson rather than stacking a new one.
 - Treat the memory store dialectically too: (1) contradicting memories are not necessarily wrong — separate conditions and timing before judging; two records can both be true under different conditions; (2) when a new decision supersedes an old one, mark the old record as superseded ("已由 <X> 更新/覆盖") instead of leaving silent contradictions; (3) before forgetting a memory, confirm its conditions are truly gone — do not discard it merely because it feels outdated.
@@ -676,14 +873,33 @@ export async function apply(ctx: Context, config: Schemastery.TypeT<typeof Confi
   };
   const refreshFingerprint = () => { baseFingerprint = fingerprint(); };
 
-  const makeCore = () => new MemoryCore((domain.table('records') as unknown) as MemoryTable, config, guard, refreshFingerprint);
+  // Semantic channel wiring. The model directory is explicit configuration —
+  // the plugin never downloads anything on its own, and an empty value means
+  // "stay lexical-only", which is also what happens when the optional
+  // @huggingface/transformers package is absent.
+  const semanticConfig: SemanticConfig | null = config.semanticEnabled && config.semanticModelDir !== ''
+    ? {
+        modelDir: config.semanticModelDir,
+        cacheDir: config.semanticCacheDir !== ''
+          ? config.semanticCacheDir
+          : join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'storages', 'memory-semantic'),
+      }
+    : null;
+  const coreConfig = { ...config, semantic: semanticConfig };
+  const makeCore = () => new MemoryCore((domain.table('records') as unknown) as MemoryTable, coreConfig, guard, refreshFingerprint);
   let core = makeCore();
 
   // UI-facing RPC (web only): browse/manage memories from the settings panel.
-  // Registered defensively — headless profiles have no connection service.
-  ctx.inject(['connection'], (webContext: any) => {
+  // 必须同时注入 connection 与 webServer:0.1.5-rc.2 的 connection.rpc.handle() 会从
+  // **调用方 ctx** 解析 webServer,只注入 connection 时它静默丢掉路由(面板报 HTTP 405)。
+  // 注册与自注册兜底见 src/rpc.ts 顶部说明。
+  ctx.inject(['connection', 'webServer'], (webContext: any) => {
     if (webContext?.connection === undefined) return;
-    registerRpc(webContext.connection as never, core);
+    registerRpc(
+      { connection: webContext.connection, webServer: webContext.webServer },
+      () => core,
+      (message) => ctx.logger?.warn?.(message),
+    );
   });
 
   ctx.tools.register(defineTool({
@@ -698,6 +914,12 @@ export async function apply(ctx: Context, config: Schemastery.TypeT<typeof Confi
       project: { type: 'string', description: 'For scope=project: the project path this memory belongs to. Fill from your known working directory ({{cwd}}).' },
       importance: { type: 'number', description: '1 nice-to-know, 2 useful, 3 critical (never evicted for space). Defaults to 2.' },
       ttl_days: { type: 'number', description: 'Optional: auto-expire after N days (e.g. temporary credentials, short-lived decisions). Max 3650.' },
+      supersedes: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          'Ids of older memories this one REPLACES (e.g. a decision that changed). They stay stored — auditable — but are heavily down-weighted so they stop being presented as the current conclusion. Use whenever a previously stored conclusion no longer holds.',
+      },
     },
     output: jsonOutput(),
     execute(args) {
@@ -709,6 +931,7 @@ export async function apply(ctx: Context, config: Schemastery.TypeT<typeof Confi
         project: typeof args.project === 'string' && args.project !== '' ? args.project : undefined,
         importance: typeof args.importance === 'number' ? args.importance : undefined,
         ttlDays: typeof args.ttl_days === 'number' ? args.ttl_days : undefined,
+        supersedes: Array.isArray(args.supersedes) ? args.supersedes.map(String) : undefined,
       });
     },
   }));
@@ -923,11 +1146,16 @@ export async function apply(ctx: Context, config: Schemastery.TypeT<typeof Confi
         return decision; // never break the agent loop over memory
       }
       if (rec.results.length === 0) return decision;
-      // Filter by minimum score threshold, then take top injectCount.
-      const minScore = config.injectMinScore;
-      const filtered = minScore > 0
-        ? rec.results.filter((r) => r.score >= minScore).slice(0, config.injectCount)
-        : rec.results.slice(0, config.injectCount);
+      // 「宁可不给,也不硬凑」:相关性没过闸门就保持沉默。
+      // 硬凑一条无关记忆比不注入更糟 —— 它占预算,还把判断带偏。
+      if (rec.noMatch) return decision;
+      // 预算化选择:先过分数门槛,再按分数曲线决定"几条值得占注意力",
+      // 最后才受 injectCount 上限约束(见 selectForInjection 的说明)。
+      const filtered = selectForInjection(rec.results, {
+        minScore: config.injectMinScore,
+        budgetRatio: config.injectBudgetRatio,
+        limit: config.injectCount,
+      });
       if (filtered.length === 0) return decision; // nothing relevant enough
       const key = filtered.map((r) => r.id).sort().join(',');
       if (key === lastInjectedKey) return decision; // same topic, already injected

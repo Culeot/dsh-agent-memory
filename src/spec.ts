@@ -41,6 +41,17 @@ export const MemoryRecordSchema = z.object({
   accessCount: z.number().int().min(0),
   /** ISO timestamp after which the record is retired from recall; null = never. */
   expiresAt: z.string().nullable(),
+  /**
+   * Id of the record that replaces this one, when a newer memory supersedes it.
+   *
+   * This is the "不腐烂" mechanism: the protocol has always *asked* the model to
+   * write "已由 X 更新" into the body when a decision changes, which relies on
+   * discipline and leaves the stale record ranking as high as the fresh one.
+   * Making the relation data lets the ranker down-weight it instead.
+   *
+   * Optional so records written before this field existed still parse.
+   */
+  supersededBy: z.string().nullable().optional(),
 });
 export type MemoryRecord = z.infer<typeof MemoryRecordSchema>;
 

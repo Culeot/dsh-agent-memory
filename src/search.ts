@@ -78,6 +78,17 @@ export interface RankOptions {
   now?: number;
   /** Recency half-life in days. */
   recencyHalfLifeDays?: number;
+  /**
+   * Slope of the importance boost: boost = 1 + (importance - 1) * slope.
+   *
+   * Measured on a 382-query held-out set built from a real memory bank:
+   * the historical slope 0.75 cost **-0.046 MRR** versus no boost at all
+   * (0.7248 vs 0.7708), because 7 of 10 records sit at importance 3 — the
+   * boost stops separating anything and only drags importance-2 records down.
+   * Slope 0.25 recovers most of the loss (0.7968 within the fused pipeline)
+   * while keeping the product intent. Pass 0 to disable entirely.
+   */
+  boostSlope?: number;
 }
 
 export interface ScoredRecord {
@@ -85,6 +96,14 @@ export interface ScoredRecord {
   score: number;
   /** Human-readable hit reasons (query ranking only; absent for hot set). */
   reasons?: string[];
+  /** Lexical base before boosts (query ranking only; absent for the hot set). */
+  base?: number;
+  /**
+   * Fused relevance before boosts, on a 0..1 scale (hybrid path only).
+   * The "say nothing rather than something wrong" gate compares against this,
+   * because boosts must not be able to talk the system into a match.
+   */
+  relevance?: number;
 }
 
 const ACCESS_BOOST_CAP = 1.5;
@@ -108,6 +127,61 @@ function lastActive(record: MemoryRecord, fallbackNow: number): number {
  * association" on short queries like "ok了吗".
  */
 export const MATCH_BASE_MIN = 1.0;
+
+/**
+ * Default slope of the importance boost (see {@link RankOptions.boostSlope}).
+ *
+ * Calibrated on a 382-query held-out set, sweeping w × slope together
+ * (`src/mem_tune_final.py` in the jev-as-llm project):
+ *
+ *     slope 0.00 → full MRR 0.8358   R@1 0.7513
+ *     slope 0.10 → full MRR 0.8320   R@1 0.7539   ← chosen (near-lossless, R@1 best)
+ *     slope 0.25 → full MRR 0.8032   R@1 0.7042
+ *     slope 0.75 → full MRR 0.7570   R@1 0.6466   (the historical value)
+ *
+ * 0.1 keeps the product intent ("important memories rank a little higher")
+ * at a cost of 0.004 MRR; anything above 0.25 starts replacing relevance with
+ * importance rather than nudging it.
+ */
+export const IMPORTANCE_BOOST_SLOPE = 0.1;
+
+/** Lexical base at which the lexical channel saturates when fused (maps base→0..1). */
+export const LEXICAL_SATURATION = 4.0;
+
+/**
+ * Default weight of the semantic channel: relevance = w*semantic + (1-w)*lexical.
+ *
+ * Swept 0..1 on the 382-query set — the optimum sits near **0.3**, not the 0.65
+ * an earlier evaluation suggested. The two evaluations are NOT comparable:
+ * this module normalizes linearly (`min(1, base/4)` and a clamped cosine) while
+ * that script used z-scores, so the same model at the same w yields different
+ * numbers under each formula. Always compare within one formula.
+ *
+ *     w 0.0  → 0.7006   (lexical only, truncated by the saturation cap)
+ *     w 0.3  → 0.8358   ← chosen
+ *     w 0.5  → 0.8348
+ *     w 0.65 → 0.8079
+ *     w 1.0  → 0.7121   (semantic only)
+ */
+export const DEFAULT_SEMANTIC_WEIGHT = 0.3;
+
+/** Minimum cosine for a record with no lexical hit to still count as a match. */
+export const DEFAULT_SEMANTIC_MIN = 0.5;
+
+/**
+ * Score multiplier for a record that a newer memory has superseded.
+ *
+ * Superseded records are kept — auditable, and reversible by clearing
+ * `supersededBy` — but they must stop being presented as the current
+ * conclusion. 0.25 pushes them below fresh records in a normal candidate pool
+ * without hiding them entirely.
+ */
+export const SUPERSEDED_PENALTY = 0.25;
+
+function clamp01(x: number): number {
+  if (!Number.isFinite(x)) return 0;
+  return x < 0 ? 0 : x > 1 ? 1 : x;
+}
 
 /** Common filler words that carry no retrieval information. */
 const STOPWORDS = new Set([
@@ -165,6 +239,8 @@ export interface ExplainResult {
   score: number;
   /** Human-readable reasons, best-contributing first. */
   reasons: string[];
+  /** Lexical base before boosts (0 when the match is below MATCH_BASE_MIN). */
+  base: number;
 }
 
 /**
@@ -178,7 +254,7 @@ export interface ExplainResult {
  */
 export function explainRecord(record: MemoryRecord, query: string, options: RankOptions = {}): ExplainResult {
   const q = query.trim();
-  if (q === '') return { score: 0, reasons: [] };
+  if (q === '') return { score: 0, reasons: [], base: 0 };
 
   const contentLower = record.content.toLowerCase();
   const queryLower = q.toLowerCase();
@@ -234,22 +310,29 @@ export function explainRecord(record: MemoryRecord, query: string, options: Rank
     reasons.push(`bm25:${bm.toFixed(2)}(+${bm.toFixed(2)})`);
   }
 
-  if (base < MATCH_BASE_MIN) return { score: 0, reasons };
+  if (base < MATCH_BASE_MIN) return { score: 0, reasons, base: 0 };
 
-  const importanceBoost = 1 + (record.importance - 1) * 0.75; // 1.0 / 1.75 / 2.5
+  const slope = options.boostSlope ?? IMPORTANCE_BOOST_SLOPE;
+  const importanceBoost = 1 + (record.importance - 1) * slope;
   const halfLifeDays = options.recencyHalfLifeDays ?? 90;
   const now = options.now ?? Date.now();
   const ageMs = now - lastActive(record, now);
   const recencyBoost = Math.pow(0.5, ageMs / (halfLifeDays * 24 * 3600 * 1000));
   const accessBoost = Math.min(ACCESS_BOOST_CAP, 1 + Math.log(1 + record.accessCount) * 0.15);
 
-  const score = base * importanceBoost * recencyBoost * accessBoost;
+  const supersededBoost = record.supersededBy ? SUPERSEDED_PENALTY : 1;
+  const score = base * importanceBoost * recencyBoost * accessBoost * supersededBoost;
   if (importanceBoost > 1) reasons.push(`importance:${record.importance}(×${importanceBoost.toFixed(2)})`);
   const ageDays = ageMs / (24 * 3600 * 1000);
   reasons.push(`recency:${ageDays.toFixed(1)} 天前活跃(×${recencyBoost.toFixed(2)})`);
   if (record.accessCount > 0) reasons.push(`access:${record.accessCount} 次(×${accessBoost.toFixed(2)})`);
   if (baseParts.length > 0) reasons.unshift(`base:${baseParts.join('+')}`);
-  return { score, reasons: reasons.slice(0, 8) };
+  // 「被取代」必须排在最前面:它是最该被看见的事实,而 reasons 只保留前 8 条 ——
+  // 排在末尾等于被丢掉(实测:它正是被 slice 砍掉的那一条,测试因此失败)。
+  if (record.supersededBy !== null && record.supersededBy !== undefined) {
+    reasons.unshift(`superseded:已被 ${record.supersededBy} 取代(×${SUPERSEDED_PENALTY})`);
+  }
+  return { score, reasons: reasons.slice(0, 8), base };
 }
 
 /** Compatibility wrapper: plain score (existing API/tests keep working). */
@@ -273,7 +356,7 @@ export function hotnessScore(record: MemoryRecord, options: RankOptions = {}): n
   const now = options.now ?? Date.now();
   const ageMs = now - lastActive(record, now);
   const recencyBoost = Math.pow(0.5, ageMs / (halfLifeDays * 24 * 3600 * 1000));
-  const importanceBoost = 1 + (record.importance - 1) * 0.75;
+  const importanceBoost = 1 + (record.importance - 1) * (options.boostSlope ?? IMPORTANCE_BOOST_SLOPE);
   const accessBoost = Math.min(ACCESS_BOOST_CAP, 1 + Math.log(1 + record.accessCount) * 0.15);
   return recencyBoost * importanceBoost * accessBoost;
 }
@@ -304,8 +387,115 @@ export function rankRecords(records: readonly MemoryRecord[], query: string, lim
   for (const record of records) {
     if (isExpired(record, now)) continue;
     const explained = explainRecord(record, query, { ...options, now });
-    if (explained.score > 0) scored.push({ record, score: explained.score, reasons: explained.reasons });
+    if (explained.score > 0) scored.push({ record, score: explained.score, reasons: explained.reasons, base: explained.base });
   }
   scored.sort((a, b) => b.score - a.score);
   return scored.slice(0, Math.max(0, limit));
+}
+
+/**
+ * Business boosts (importance × recency × access), applied AFTER relevance.
+ * Kept separate so the fusion path can scale a relevance score that came from
+ * either channel — in the lexical path the same product is folded into
+ * {@link explainRecord}.
+ */
+export function recordBoost(record: MemoryRecord, options: RankOptions = {}, now: number = Date.now()): number {
+  const slope = options.boostSlope ?? IMPORTANCE_BOOST_SLOPE;
+  const importanceBoost = 1 + (record.importance - 1) * slope;
+  const halfLifeDays = options.recencyHalfLifeDays ?? 90;
+  const ageMs = now - lastActive(record, now);
+  const recencyBoost = Math.pow(0.5, ageMs / (halfLifeDays * 24 * 3600 * 1000));
+  const accessBoost = Math.min(ACCESS_BOOST_CAP, 1 + Math.log(1 + record.accessCount) * 0.15);
+  return importanceBoost * recencyBoost * accessBoost;
+}
+
+/** Options for hybrid (lexical + semantic) ranking. */
+export interface HybridOptions extends RankOptions {
+  /** Per-record cosine similarity in the same order as `records`; null/absent = lexical only. */
+  semantic?: readonly number[] | null;
+  /** Weight of the semantic channel: relevance = w*semantic + (1-w)*lexical. */
+  semanticWeight?: number;
+  /** Minimum cosine for a record with no lexical hit to still count as a match. */
+  semanticMin?: number;
+}
+
+/**
+ * Rank records with the lexical and semantic channels fused.
+ *
+ * Why fuse instead of crowning a winner — measured on this memory bank
+ * (382 held-out queries): neither channel wins alone. Lexical dominates
+ * keyword-shaped and term-shaped queries (MRR 0.9505 / 0.9504 versus the
+ * model's 0.8853 / 0.8181), the model dominates conversational ones
+ * (0.7396 vs 0.6267). Fused: **0.8432**, above both.
+ *
+ * The channels are normalized before mixing because their raw scales are
+ * unrelated (lexical base runs 0..~10, cosine -1..1): lexical saturates at
+ * {@link LEXICAL_SATURATION}, cosine is clamped to 0..1. A record counts as a
+ * match when either channel finds it — requiring a lexical hit would throw
+ * away exactly the paraphrases the semantic channel exists to catch.
+ *
+ * When `semantic` is absent or the wrong length this degrades to
+ * {@link rankRecords}, so callers can pass a channel that failed to load.
+ */
+export function rankRecordsHybrid(
+  records: readonly MemoryRecord[],
+  query: string,
+  limit: number,
+  options: HybridOptions = {},
+): ScoredRecord[] {
+  const semantic = options.semantic;
+  if (!semantic || semantic.length !== records.length) {
+    return rankRecords(records, query, limit, options);
+  }
+  const now = options.now ?? Date.now();
+  const w = clamp01(options.semanticWeight ?? DEFAULT_SEMANTIC_WEIGHT);
+  const semMin = options.semanticMin ?? DEFAULT_SEMANTIC_MIN;
+  const scored: ScoredRecord[] = [];
+  for (let i = 0; i < records.length; i += 1) {
+    const record = records[i]!;
+    if (isExpired(record, now)) continue;
+    const explained = explainRecord(record, query, { ...options, now });
+    const cos = clamp01(semantic[i]!);
+    const lexicalHit = explained.base >= MATCH_BASE_MIN;
+    if (!lexicalHit && cos < semMin) continue; // neither channel finds it
+    const lexPart = clamp01(explained.base / LEXICAL_SATURATION);
+    const relevance = w * cos + (1 - w) * lexPart;
+    const penalty = record.supersededBy ? SUPERSEDED_PENALTY : 1;
+    const score = relevance * recordBoost(record, options, now) * penalty;
+    const reasons = [
+      `fuse:sem=${cos.toFixed(2)} lex=${lexPart.toFixed(2)} w=${w.toFixed(2)}`,
+      ...(record.supersededBy ? [`superseded:已被 ${record.supersededBy} 取代(×${SUPERSEDED_PENALTY})`] : []),
+      ...explained.reasons,
+    ].slice(0, 8);
+    if (score > 0) scored.push({ record, score, reasons, base: explained.base, relevance });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, Math.max(0, limit));
+}
+
+/**
+ * How many records the hybrid ranker would admit as matches, before the limit
+ * cut. Mirrors {@link rankRecordsHybrid}'s admission rule exactly: a record
+ * counts when EITHER channel finds it (requiring a lexical hit would discard
+ * the paraphrases the semantic channel exists to catch).
+ */
+export function countHybridMatches(
+  records: readonly MemoryRecord[],
+  query: string,
+  options: HybridOptions = {},
+): number {
+  const semantic = options.semantic;
+  const now = options.now ?? Date.now();
+  const semMin = options.semanticMin ?? DEFAULT_SEMANTIC_MIN;
+  let count = 0;
+  for (let i = 0; i < records.length; i += 1) {
+    const record = records[i]!;
+    if (isExpired(record, now)) continue;
+    if (explainRecord(record, query, { ...options, now }).base >= MATCH_BASE_MIN) {
+      count += 1;
+      continue;
+    }
+    if (semantic && semantic.length === records.length && clamp01(semantic[i]!) >= semMin) count += 1;
+  }
+  return count;
 }
